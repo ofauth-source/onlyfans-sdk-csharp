@@ -55,7 +55,7 @@ var client = new OFAuthClient("your-api-key")
 // Full configuration
 var client = new OFAuthClient(
     apiKey: "your-api-key",
-    baseUrl: "https://api-next.ofauth.com",  // Optional
+    baseUrl: "https://api.ofauth.com",  // Optional
     httpClient: customHttpClient              // Optional, for custom settings
 );
 
@@ -227,7 +227,7 @@ services.AddSingleton<OFAuthClient>(sp =>
 // Or with HttpClientFactory
 services.AddHttpClient<OFAuthClient>((sp, client) =>
 {
-    client.BaseAddress = new Uri("https://api-next.ofauth.com");
+    client.BaseAddress = new Uri("https://api.ofauth.com");
 });
 ```
 

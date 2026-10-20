@@ -41,7 +41,7 @@ namespace OFAuth
         private string? _connectionId;
         private bool _disposed;
 
-        public const string DefaultBaseUrl = "https://api-next.ofauth.com";
+        public const string DefaultBaseUrl = "https://api.ofauth.com";
 
         public OFAuthClient(string apiKey, string? baseUrl = null, HttpClient? httpClient = null)
         {
