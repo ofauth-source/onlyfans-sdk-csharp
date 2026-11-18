@@ -4,11 +4,23 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>OFAuth</RootNamespace>
+    <AssemblyName>OFAuth</AssemblyName>
     <PackageId>OnlyFans.SDK</PackageId>
-    <Version>3.1.0</Version>
+    <Version>4.0.0-rc.1</Version>
     <Authors>OFAuth</Authors>
-    <Description>OFAuth C# SDK v2 - Type-safe API client with generated models</Description>
+    <Description>OFAuth V3 C# SDK: OAuth (Link), typed Access and Vault+ operations, webhooks, Realtime, and uploads.</Description>
+    <PackageTags>ofauth;onlyfans;onlyfans-api;oauth;sdk;webhooks</PackageTags>
+    <PackageProjectUrl>https://docs.ofauth.com</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/OFAuth-org/onlyfans-sdk-csharp</RepositoryUrl>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
 
 </Project>

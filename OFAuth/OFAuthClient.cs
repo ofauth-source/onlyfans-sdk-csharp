@@ -1,158 +1,140 @@
-using System;
-using System.Collections.Generic;
-using System.Net.Http;
-using System.Net.Http.Json;
-using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Web;
+// OFAuth V3 client root. The namespaces (Access, VaultPlus, LinkedAccounts) are generated in Client.g.cs.
+// Copied from scripts/templates/csharp by scripts/generate-csharp.mjs.
+#nullable enable
 
-namespace OFAuth
+namespace OFAuth;
+
+/// <summary>
+/// OFAuth V3 API client for one authorization.
+/// </summary>
+/// <example>
+/// <code>
+/// var client = new OFAuthClient(new OFAuthClientOptions { AccessToken = token, LinkedAccountId = "conn_123" });
+/// var profile = await client.Access.Profile.GetAsync();
+/// await foreach (var chat in client.Access.Chats.IterateAsync()) Console.WriteLine(chat.User?.Id);
+/// </code>
+/// </example>
+public sealed partial class OFAuthClient
 {
-    /// <summary>
-    /// OFAuth API error
-    /// </summary>
-    public class OFAuthException : Exception
-    {
-        public int Status { get; }
-        public string? Code { get; }
-        public object? Details { get; }
+    private readonly ApiTransport _transport;
 
-        public OFAuthException(int status, string message, string? code = null, object? details = null)
-            : base(message)
+    /// <summary>Create a client from options.</summary>
+    public OFAuthClient(OFAuthClientOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        _transport = new ApiTransport(options, options.ResolveTokenProvider());
+    }
+
+    /// <summary>Create a client with a fixed access token.</summary>
+    public OFAuthClient(string accessToken, string? linkedAccountId = null, HttpClient? httpClient = null)
+        : this(new OFAuthClientOptions { AccessToken = accessToken, LinkedAccountId = linkedAccountId, HttpClient = httpClient })
+    {
+    }
+
+    /// <summary>Create a client with an access token provider from the caller's auth system.</summary>
+    public OFAuthClient(IAccessTokenProvider accessTokenProvider, string? linkedAccountId = null, HttpClient? httpClient = null)
+        : this(new OFAuthClientOptions
         {
-            Status = status;
-            Code = code;
-            Details = details;
-        }
+            AccessTokenProvider = accessTokenProvider,
+            LinkedAccountId = linkedAccountId,
+            HttpClient = httpClient,
+        })
+    {
+    }
+
+    private OFAuthClient(ApiTransport transport)
+    {
+        _transport = transport;
+    }
+
+    /// <summary>The default linked account for Access and Vault+ calls.</summary>
+    public string? LinkedAccountId => _transport.LinkedAccountId;
+
+    /// <summary>Low-level transport, for calling routes the generated client does not cover.</summary>
+    public ApiTransport Transport => _transport;
+
+    /// <summary>A client for another linked account of the same authorization. Shares the token source and HTTP client.</summary>
+    public OFAuthClient WithLinkedAccount(string linkedAccountId)
+    {
+        if (string.IsNullOrEmpty(linkedAccountId)) throw new ArgumentException("linkedAccountId is empty", nameof(linkedAccountId));
+        return new OFAuthClient(_transport.WithLinkedAccount(linkedAccountId));
     }
 
     /// <summary>
-    /// OFAuth API Client
+    /// Upload a file (start, PUT parts, finalize). Returns the upload id to use in <c>mediaItems</c>,
+    /// or the existing media when the file is already in the vault. Scope: <c>vault:write</c>.
     /// </summary>
-    public class OFAuthClient : IDisposable
+    public Task<UploadMediaResult> UploadMediaAsync(
+        byte[] data,
+        UploadMediaOptions options,
+        CancellationToken cancellationToken = default) =>
+        Uploads.UploadMediaAsync(_transport, data, options, cancellationToken);
+
+    /// <summary>Upload a stream. The stream is read into memory first (needed for the MD5 etag and part ranges).</summary>
+    public async Task<UploadMediaResult> UploadMediaAsync(
+        Stream data,
+        UploadMediaOptions options,
+        CancellationToken cancellationToken = default)
     {
-        private readonly HttpClient _httpClient;
-        private readonly string _apiKey;
-        private readonly string _baseUrl;
-        private readonly JsonSerializerOptions _jsonOptions;
-        private string? _connectionId;
-        private bool _disposed;
+        ArgumentNullException.ThrowIfNull(data);
+        using var buffer = new MemoryStream();
+        await data.CopyToAsync(buffer, cancellationToken).ConfigureAwait(false);
+        return await UploadMediaAsync(buffer.ToArray(), options, cancellationToken).ConfigureAwait(false);
+    }
 
-        public const string DefaultBaseUrl = "https://api.ofauth.com";
-
-        public OFAuthClient(string apiKey, string? baseUrl = null, HttpClient? httpClient = null)
+    /// <summary>
+    /// A Realtime event stream (Server-Sent Events) for one linked account, using this client's access token source,
+    /// <c>HttpClient</c>, <c>DefaultHeaders</c>, clock, request/response hooks, and debug logging (unless
+    /// <paramref name="options"/> sets its own hooks or logger). Call <see cref="RealtimeConnection.ConnectAsync"/> on the result.
+    /// This is the only way to create a <see cref="RealtimeConnection"/>. It always streams <c>/v3/realtime/events</c> on
+    /// the client's <c>BaseUrl</c> origin: Realtime is served on the same origin as every other API route, so the token
+    /// only goes where API requests go.
+    /// </summary>
+    /// <exception cref="OFAuthException">No linked account, or <c>BaseUrl</c> is not an http(s) URL.</exception>
+    public RealtimeConnection Realtime(RealtimeOptions? options = null)
+    {
+        options ??= new RealtimeOptions();
+        var linkedAccountId = options.LinkedAccountId ?? _transport.LinkedAccountId;
+        if (string.IsNullOrEmpty(linkedAccountId))
         {
-            _apiKey = apiKey;
-            _baseUrl = (baseUrl ?? DefaultBaseUrl).TrimEnd('/');
-            _httpClient = httpClient ?? new HttpClient();
-            _jsonOptions = new JsonSerializerOptions
-            {
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-            };
+            throw new OFAuthException("Realtime() needs a LinkedAccountId: pass one in the options or set it on the client.");
         }
+        var url = ApiTransport.RealtimeUrlFor(_transport.BaseUrl);
+        return new RealtimeConnection(
+            options with
+            {
+                LinkedAccountId = linkedAccountId,
+                OnRequest = options.OnRequest ?? _transport.OnRequest,
+                OnResponse = options.OnResponse ?? _transport.OnResponse,
+                DebugLogger = options.DebugLogger ?? _transport.Log,
+            },
+            _transport,
+            url);
+    }
 
-        public OFAuthClient WithConnectionId(string connectionId)
+    /// <summary>
+    /// Mint a Realtime stream URL for a browser (<c>POST /v3/realtime</c>). Send only <see cref="RealtimeStreamUrl.Url"/>
+    /// to the page, which opens it with <c>EventSource</c> (or <c>connectRealtimeStream</c> from the TypeScript SDK's
+    /// <c>@ofauth/onlyfans-sdk/realtime-browser</c>). The URL carries a 10-minute stream credential that can only read
+    /// this account's Realtime events; the access token never leaves your server. Rate limited to 30 per minute per
+    /// authorization. Goes through the client's retries, hooks, and errors (<see cref="OFAuthApiException"/>).
+    /// </summary>
+    /// <param name="linkedAccountId">The linked account to stream. Defaults to the client's.</param>
+    /// <param name="cancellationToken">Cancels the call.</param>
+    /// <exception cref="OFAuthException">No linked account.</exception>
+    public Task<RealtimeStreamUrl> CreateStreamUrlAsync(string? linkedAccountId = null, CancellationToken cancellationToken = default)
+    {
+        var account = linkedAccountId ?? _transport.LinkedAccountId;
+        if (string.IsNullOrEmpty(account))
         {
-            _connectionId = connectionId;
-            return this;
+            throw new OFAuthException("CreateStreamUrlAsync() needs a LinkedAccountId: pass one or set it on the client.");
         }
-
-        public async Task<T> RequestAsync<T>(
-            HttpMethod method,
-            string path,
-            Dictionary<string, string?>? query = null,
-            object? body = null,
-            string? connectionId = null,
-            CancellationToken cancellationToken = default)
-        {
-            var url = _baseUrl + path;
-            
-            if (query != null && query.Count > 0)
+        return _transport.SendAsync<RealtimeStreamUrl>(
+            new ApiRequest(HttpMethod.Post, "/v3/realtime")
             {
-                var queryString = HttpUtility.ParseQueryString(string.Empty);
-                foreach (var (key, value) in query)
-                {
-                    if (value != null)
-                        queryString[key] = value;
-                }
-                url += "?" + queryString;
-            }
-
-            using var request = new HttpRequestMessage(method, url);
-            request.Headers.Add("apiKey", _apiKey);
-            
-            var connId = connectionId ?? _connectionId;
-            if (!string.IsNullOrEmpty(connId))
-                request.Headers.Add("x-connection-id", connId);
-
-            if (body != null)
-            {
-                request.Content = new StringContent(
-                    JsonSerializer.Serialize(body, _jsonOptions),
-                    Encoding.UTF8,
-                    "application/json");
-            }
-
-            var response = await _httpClient.SendAsync(request, cancellationToken);
-            var content = await response.Content.ReadAsStringAsync(cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                try
-                {
-                    var error = JsonSerializer.Deserialize<ErrorResponse>(content, _jsonOptions);
-                    throw new OFAuthException(
-                        (int)response.StatusCode,
-                        error?.Message ?? $"HTTP {response.StatusCode}",
-                        error?.Code,
-                        error?.Details);
-                }
-                catch (JsonException)
-                {
-                    throw new OFAuthException((int)response.StatusCode, content);
-                }
-            }
-
-            if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
-                return default!;
-
-            return JsonSerializer.Deserialize<T>(content, _jsonOptions)!;
-        }
-
-        public Task<T> GetAsync<T>(string path, Dictionary<string, string?>? query = null, string? connectionId = null, CancellationToken cancellationToken = default)
-            => RequestAsync<T>(HttpMethod.Get, path, query, null, connectionId, cancellationToken);
-
-        public Task<T> PostAsync<T>(string path, object? body = null, string? connectionId = null, CancellationToken cancellationToken = default)
-            => RequestAsync<T>(HttpMethod.Post, path, null, body, connectionId, cancellationToken);
-
-        public Task<T> PutAsync<T>(string path, object? body = null, string? connectionId = null, CancellationToken cancellationToken = default)
-            => RequestAsync<T>(HttpMethod.Put, path, null, body, connectionId, cancellationToken);
-
-        public Task<T> PatchAsync<T>(string path, object? body = null, string? connectionId = null, CancellationToken cancellationToken = default)
-            => RequestAsync<T>(HttpMethod.Patch, path, null, body, connectionId, cancellationToken);
-
-        public Task<T> DeleteAsync<T>(string path, string? connectionId = null, CancellationToken cancellationToken = default)
-            => RequestAsync<T>(HttpMethod.Delete, path, null, null, connectionId, cancellationToken);
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                _httpClient.Dispose();
-                _disposed = true;
-            }
-            GC.SuppressFinalize(this);
-        }
-
-        private class ErrorResponse
-        {
-            public string? Message { get; set; }
-            public string? Code { get; set; }
-            public object? Details { get; set; }
-        }
+                Body = new Dictionary<string, string> { ["linkedAccountId"] = account },
+                Operation = "realtime.createStreamUrl",
+            },
+            cancellationToken);
     }
 }

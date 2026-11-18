@@ -1,0 +1,4 @@
+- name: Guide
+  href: ../README.md
+- name: API reference
+  href: ../obj/docfx/api/

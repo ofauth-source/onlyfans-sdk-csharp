@@ -1,420 +1,414 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
+// OFAuth webhook verification and routing (Standard Webhooks).
+// Copied from scripts/templates/csharp by scripts/generate-csharp.mjs.
+#nullable enable
+
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading.Tasks;
 
-namespace OFAuth.Webhooks
+namespace OFAuth;
+
+/// <summary>Why a webhook delivery failed verification.</summary>
+public static class WebhookVerificationErrorCodes
 {
-    // ========================================================================
-    // Errors
-    // ========================================================================
+    /// <summary>A <c>webhook-id</c>, <c>webhook-timestamp</c>, or <c>webhook-signature</c> header is missing.</summary>
+    public const string MissingHeaders = "MISSING_HEADERS";
 
-    /// <summary>
-    /// Thrown when webhook signature verification fails.
-    /// </summary>
-    public class WebhookVerificationException : Exception
+    /// <summary><c>webhook-timestamp</c> is not a Unix timestamp.</summary>
+    public const string InvalidTimestamp = "INVALID_TIMESTAMP";
+
+    /// <summary>The delivery is older or newer than the tolerance.</summary>
+    public const string TimestampOutOfTolerance = "TIMESTAMP_OUT_OF_TOLERANCE";
+
+    /// <summary><c>webhook-signature</c> has no <c>v1</c> entry.</summary>
+    public const string NoValidSignatures = "NO_VALID_SIGNATURES";
+
+    /// <summary>No signature matches the body and secret.</summary>
+    public const string SignatureMismatch = "SIGNATURE_MISMATCH";
+
+    /// <summary>The body is not a JSON object.</summary>
+    public const string InvalidJson = "INVALID_JSON";
+}
+
+/// <summary>The delivery failed verification. Respond with 400 or 401 and do not process it.</summary>
+public sealed class WebhookVerificationException : OFAuthException
+{
+    /// <summary>One of <see cref="WebhookVerificationErrorCodes"/>.</summary>
+    public string Code { get; }
+
+    /// <summary>Create a verification error.</summary>
+    /// <param name="message">What failed.</param>
+    /// <param name="code">One of <see cref="WebhookVerificationErrorCodes"/>.</param>
+    /// <param name="innerException">The cause, if any.</param>
+    public WebhookVerificationException(string message, string code, Exception? innerException = null)
+        : base(message, innerException)
     {
-        public string Code { get; }
+        Code = code;
+    }
+}
 
-        public WebhookVerificationException(string message, string code) : base(message)
+/// <summary>The signature headers of one delivery.</summary>
+/// <param name="Id"><c>webhook-id</c>.</param>
+/// <param name="Timestamp"><c>webhook-timestamp</c> (Unix seconds).</param>
+/// <param name="Signature"><c>webhook-signature</c> (space-separated <c>v1,&lt;base64&gt;</c> entries).</param>
+public sealed record WebhookHeaders(string Id, string Timestamp, string Signature);
+
+/// <summary>
+/// A verified webhook event. Every event has the same envelope; <see cref="Data"/> depends on <see cref="Type"/>.
+/// Use <see cref="Deserialize{T}"/> or <see cref="GetData{T}"/> for the typed classes listed in
+/// <see cref="WebhookEventTypes"/>.
+/// </summary>
+public sealed class WebhookEvent
+{
+    /// <summary>Unique event id. Deduplicate on it: deliveries are retried.</summary>
+    [JsonPropertyName("eventId")] public string EventId { get; set; } = "";
+
+    /// <summary>Event type, e.g. <c>authorization.revoked</c>. See <see cref="WebhookEventTypes"/>.</summary>
+    [JsonPropertyName("type")] public string Type { get; set; } = "";
+
+    /// <summary>Envelope schema version (<c>1</c>).</summary>
+    [JsonPropertyName("schemaVersion")] public string SchemaVersion { get; set; } = "";
+
+    /// <summary>Per linked account ordering. Apply events in this order: retries can arrive out of order.</summary>
+    [JsonPropertyName("order")] public long Order { get; set; }
+
+    /// <summary>When the event happened (ISO 8601).</summary>
+    [JsonPropertyName("occurredAt")] public string OccurredAt { get; set; } = "";
+
+    /// <summary><c>sandbox</c>, <c>test</c>, or <c>live</c>.</summary>
+    [JsonPropertyName("environment")] public string Environment { get; set; } = "";
+
+    /// <summary>Your integration id.</summary>
+    [JsonPropertyName("integrationId")] public string IntegrationId { get; set; } = "";
+
+    /// <summary>The OAuth client the authorization belongs to.</summary>
+    [JsonPropertyName("externalOauthClientId")] public string? ExternalOauthClientId { get; set; }
+
+    /// <summary>The authorization identifier from the API.</summary>
+    [JsonPropertyName("authorizationId")] public string? AuthorizationId { get; set; }
+
+    /// <summary>Null for <c>authorization.*</c> events.</summary>
+    [JsonPropertyName("linkedAccountId")] public string? LinkedAccountId { get; set; }
+
+    /// <summary>True for test deliveries.</summary>
+    [JsonPropertyName("test")] public bool Test { get; set; }
+
+    /// <summary>Event payload. Its shape depends on <see cref="Type"/>.</summary>
+    [JsonPropertyName("data")] public JsonElement Data { get; set; }
+
+    /// <summary>The raw JSON body.</summary>
+    [JsonIgnore] public string RawJson { get; internal set; } = "";
+
+    /// <summary>True for <c>authorization.*</c> and <c>linked_account.*</c> events.</summary>
+    [JsonIgnore]
+    public bool IsLifecycle => Type.StartsWith("authorization.", StringComparison.Ordinal)
+        || Type.StartsWith("linked_account.", StringComparison.Ordinal);
+
+    /// <summary>The whole event as a typed envelope, e.g. <c>LifecycleAuthorizationRevokedEnvelope</c>.</summary>
+    public T Deserialize<T>() => JsonSerializer.Deserialize<T>(RawJson, ApiTransport.JsonOptions)!;
+
+    /// <summary><see cref="Data"/> as a typed class, e.g. <c>RealtimeChatMessageReceivedData</c>.</summary>
+    public T GetData<T>() => Data.Deserialize<T>(ApiTransport.JsonOptions)!;
+
+    internal static WebhookEvent Parse(string json)
+    {
+        WebhookEvent? parsed;
+        try
         {
-            Code = code;
+            parsed = JsonSerializer.Deserialize<WebhookEvent>(json, ApiTransport.JsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            throw new WebhookVerificationException("Webhook body is not valid JSON", WebhookVerificationErrorCodes.InvalidJson, ex);
+        }
+        if (parsed is null)
+        {
+            throw new WebhookVerificationException("Webhook body is not a JSON object", WebhookVerificationErrorCodes.InvalidJson);
+        }
+        parsed.Data = parsed.Data.ValueKind == JsonValueKind.Undefined ? default : parsed.Data.Clone();
+        parsed.RawJson = json;
+        return parsed;
+    }
+}
+
+/// <summary>
+/// Webhook verification. Deliveries follow Standard Webhooks: <c>webhook-id</c>, <c>webhook-timestamp</c>, and
+/// <c>webhook-signature</c> headers (<c>svix-*</c> accepted too), signed with HMAC-SHA256 over
+/// <c>{id}.{timestamp}.{body}</c> with the destination's <c>whsec_</c> secret.
+/// </summary>
+/// <example>
+/// <code>
+/// // ASP.NET Core minimal API
+/// app.MapPost("/webhooks/ofauth", async (HttpRequest request) =>
+/// {
+///     using var reader = new StreamReader(request.Body);
+///     var body = await reader.ReadToEndAsync();
+///     var evt = Webhooks.Verify(body, name => request.Headers[name].ToString(), secret);
+///     return Results.Ok();
+/// });
+/// </code>
+/// </example>
+public static class Webhooks
+{
+    /// <summary>Default maximum age of a delivery.</summary>
+    public static readonly TimeSpan DefaultTolerance = TimeSpan.FromMinutes(5);
+
+    /// <summary>Read the signature headers with a header lookup (case-insensitive names are the caller's job).</summary>
+    public static WebhookHeaders ExtractHeaders(Func<string, string?> getHeader)
+    {
+        ArgumentNullException.ThrowIfNull(getHeader);
+        string? Get(string name) => getHeader(name) is { Length: > 0 } value ? value : null;
+        var id = Get("webhook-id") ?? Get("svix-id");
+        var timestamp = Get("webhook-timestamp") ?? Get("svix-timestamp");
+        var signature = Get("webhook-signature") ?? Get("svix-signature");
+        if (id is null || timestamp is null || signature is null)
+        {
+            throw new WebhookVerificationException(
+                "Missing webhook-id, webhook-timestamp, or webhook-signature header", WebhookVerificationErrorCodes.MissingHeaders);
+        }
+        return new WebhookHeaders(id, timestamp, signature);
+    }
+
+    /// <summary>Read the signature headers from name/value pairs (names are matched case-insensitively).</summary>
+    public static WebhookHeaders ExtractHeaders(IEnumerable<KeyValuePair<string, string>> headers)
+    {
+        ArgumentNullException.ThrowIfNull(headers);
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var header in headers) map.TryAdd(header.Key, header.Value);
+        return ExtractHeaders(name => map.TryGetValue(name, out var value) ? value : null);
+    }
+
+    /// <summary>Verify a delivery's signature against the raw body. Throws <see cref="WebhookVerificationException"/>.</summary>
+    public static void VerifySignature(
+        string payload,
+        WebhookHeaders headers,
+        string secret,
+        TimeSpan? tolerance = null,
+        DateTimeOffset? now = null)
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+        ArgumentNullException.ThrowIfNull(headers);
+        ArgumentNullException.ThrowIfNull(secret);
+
+        if (!long.TryParse(headers.Timestamp, NumberStyles.None, CultureInfo.InvariantCulture, out var timestamp))
+        {
+            throw new WebhookVerificationException("Invalid webhook-timestamp", WebhookVerificationErrorCodes.InvalidTimestamp);
+        }
+        var current = (now ?? DateTimeOffset.UtcNow).ToUnixTimeSeconds();
+        if (Math.Abs(current - timestamp) > (tolerance ?? DefaultTolerance).TotalSeconds)
+        {
+            throw new WebhookVerificationException(
+                "Webhook timestamp is outside the tolerance", WebhookVerificationErrorCodes.TimestampOutOfTolerance);
+        }
+
+        var signatures = headers.Signature
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Select(entry => entry.Split(',', 2))
+            .Where(parts => parts.Length == 2 && parts[0] == "v1" && parts[1].Length > 0)
+            .Select(parts => parts[1])
+            .ToList();
+        if (signatures.Count == 0)
+        {
+            throw new WebhookVerificationException(
+                "No v1 signature in webhook-signature", WebhookVerificationErrorCodes.NoValidSignatures);
+        }
+
+        byte[] key;
+        try
+        {
+            key = Convert.FromBase64String(secret.StartsWith("whsec_", StringComparison.Ordinal) ? secret[6..] : secret);
+        }
+        catch (FormatException ex)
+        {
+            throw new ArgumentException("The webhook secret is not valid base64 (expected whsec_...)", nameof(secret), ex);
+        }
+        var signed = Encoding.UTF8.GetBytes($"{headers.Id}.{headers.Timestamp}.{payload}");
+        var expected = Encoding.ASCII.GetBytes(Convert.ToBase64String(HMACSHA256.HashData(key, signed)));
+
+        var match = false;
+        foreach (var signature in signatures)
+        {
+            // Check every entry so timing does not reveal which one matched.
+            match |= CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(signature), expected);
+        }
+        if (!match)
+        {
+            throw new WebhookVerificationException("Webhook signature does not match", WebhookVerificationErrorCodes.SignatureMismatch);
         }
     }
 
-    // ========================================================================
-    // Types
-    // ========================================================================
-
-    /// <summary>
-    /// Extracted Svix webhook headers.
-    /// </summary>
-    public record WebhookHeaders(string SvixId, string SvixTimestamp, string SvixSignature);
-
-    /// <summary>
-    /// User data from OnlyFans.
-    /// </summary>
-    public class WebhookUserData
+    /// <summary>Verify a delivery and parse its event. Pass the raw body exactly as received.</summary>
+    public static WebhookEvent Verify(string payload, Func<string, string?> getHeader, string secret, TimeSpan? tolerance = null)
     {
-        [JsonPropertyName("userId")]
-        public string UserId { get; set; } = "";
+        VerifySignature(payload, ExtractHeaders(getHeader), secret, tolerance);
+        return WebhookEvent.Parse(payload);
+    }
 
-        [JsonPropertyName("name")]
-        public string Name { get; set; } = "";
+    /// <summary>Verify a delivery and parse its event. Pass the raw body exactly as received.</summary>
+    public static WebhookEvent Verify(
+        string payload,
+        IEnumerable<KeyValuePair<string, string>> headers,
+        string secret,
+        TimeSpan? tolerance = null)
+    {
+        VerifySignature(payload, ExtractHeaders(headers), secret, tolerance);
+        return WebhookEvent.Parse(payload);
+    }
 
-        [JsonPropertyName("username")]
-        public string Username { get; set; } = "";
+    /// <summary>Verify a UTF-8 body and parse its event.</summary>
+    public static WebhookEvent Verify(byte[] payload, Func<string, string?> getHeader, string secret, TimeSpan? tolerance = null) =>
+        Verify(Encoding.UTF8.GetString(payload), getHeader, secret, tolerance);
 
-        [JsonPropertyName("avatar")]
-        public string Avatar { get; set; } = "";
+    /// <summary>Verify a UTF-8 body and parse its event.</summary>
+    public static WebhookEvent Verify(
+        byte[] payload,
+        IEnumerable<KeyValuePair<string, string>> headers,
+        string secret,
+        TimeSpan? tolerance = null) =>
+        Verify(Encoding.UTF8.GetString(payload), headers, secret, tolerance);
+}
+
+/// <summary>The outcome of <see cref="WebhookRouter.ProcessAsync"/>: what to send back to OFAuth.</summary>
+public sealed record WebhookProcessResult(int StatusCode, string? ResponseBody, WebhookEvent? Event, Exception? Exception);
+
+/// <summary>
+/// Verifies deliveries and dispatches them by <c>type</c>. Typed <c>On...</c> methods are generated for every event.
+/// </summary>
+/// <remarks>Deduplicate on <c>eventId</c>, and apply events per <c>linkedAccountId</c> in <c>order</c>.</remarks>
+/// <example>
+/// <code>
+/// var router = new WebhookRouter(secret)
+///     .OnAuthorizationRevoked(async e => await DeleteTokens(e.AuthorizationId))
+///     .OnRealtimeChatMessageReceived(e => Console.WriteLine(e.Data.Id))
+///     .OnDefault(e => Console.WriteLine($"unhandled {e.Type}"));
+/// var result = await router.ProcessAsync(body, name => request.Headers[name].ToString());
+/// // respond with result.StatusCode
+/// </code>
+/// </example>
+public sealed partial class WebhookRouter
+{
+    private readonly Dictionary<string, Func<WebhookEvent, Task>> _handlers = new(StringComparer.Ordinal);
+    private Func<WebhookEvent, Task>? _defaultHandler;
+    private string _secret;
+
+    /// <summary>Create a router.</summary>
+    /// <param name="secret">The destination's <c>whsec_</c> signing secret.</param>
+    /// <param name="tolerance">Maximum delivery age. Defaults to 5 minutes.</param>
+    public WebhookRouter(string secret, TimeSpan? tolerance = null)
+    {
+        _secret = secret ?? throw new ArgumentNullException(nameof(secret));
+        Tolerance = tolerance;
+    }
+
+    /// <summary>Maximum delivery age. Defaults to 5 minutes.</summary>
+    public TimeSpan? Tolerance { get; set; }
+
+    internal string Secret => _secret;
+
+    /// <summary>Handle one event type with the untyped event.</summary>
+    public WebhookRouter On(string type, Func<WebhookEvent, Task> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        _handlers[type] = handler;
+        return this;
+    }
+
+    /// <summary>Handle one event type with the untyped event.</summary>
+    public WebhookRouter On(string type, Action<WebhookEvent> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        return On(type, e =>
+        {
+            handler(e);
+            return Task.CompletedTask;
+        });
+    }
+
+    /// <summary>Handle one event type with a typed envelope (see <see cref="WebhookEventTypes.EnvelopeTypes"/>).</summary>
+    public WebhookRouter On<TEnvelope>(string type, Func<TEnvelope, Task> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        return On(type, e => handler(e.Deserialize<TEnvelope>()));
+    }
+
+    /// <summary>Handle one event type with a typed envelope.</summary>
+    public WebhookRouter On<TEnvelope>(string type, Action<TEnvelope> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        return On(type, e => handler(e.Deserialize<TEnvelope>()));
+    }
+
+    /// <summary>Handle events without a specific handler.</summary>
+    public WebhookRouter OnDefault(Func<WebhookEvent, Task> handler)
+    {
+        _defaultHandler = handler ?? throw new ArgumentNullException(nameof(handler));
+        return this;
+    }
+
+    /// <summary>Handle events without a specific handler.</summary>
+    public WebhookRouter OnDefault(Action<WebhookEvent> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        return OnDefault(e =>
+        {
+            handler(e);
+            return Task.CompletedTask;
+        });
+    }
+
+    /// <summary>Rotate the signing secret.</summary>
+    public void SetSecret(string secret) => _secret = secret ?? throw new ArgumentNullException(nameof(secret));
+
+    /// <summary>Verify and dispatch a raw delivery. Returns the event; throws on verification or handler errors.</summary>
+    public async Task<WebhookEvent> HandleAsync(string payload, Func<string, string?> getHeader)
+    {
+        var evt = Webhooks.Verify(payload, getHeader, _secret, Tolerance);
+        await DispatchAsync(evt).ConfigureAwait(false);
+        return evt;
+    }
+
+    /// <summary>Verify and dispatch a raw delivery. Returns the event; throws on verification or handler errors.</summary>
+    public async Task<WebhookEvent> HandleAsync(string payload, IEnumerable<KeyValuePair<string, string>> headers)
+    {
+        var evt = Webhooks.Verify(payload, headers, _secret, Tolerance);
+        await DispatchAsync(evt).ConfigureAwait(false);
+        return evt;
     }
 
     /// <summary>
-    /// Connection object in webhook events.
+    /// Framework-agnostic handler: verifies and dispatches, never throws. Respond with
+    /// <see cref="WebhookProcessResult.StatusCode"/>: 200 on success, 401 when verification fails, 500 when a
+    /// handler throws (OFAuth retries).
     /// </summary>
-    public class WebhookConnection
+    public async Task<WebhookProcessResult> ProcessAsync(string payload, Func<string, string?> getHeader)
     {
-        [JsonPropertyName("id")]
-        public string Id { get; set; } = "";
-
-        [JsonPropertyName("platformUserId")]
-        public string PlatformUserId { get; set; } = "";
-
-        [JsonPropertyName("status")]
-        public string Status { get; set; } = "";
-
-        [JsonPropertyName("userData")]
-        public WebhookUserData? UserData { get; set; }
-
-        [JsonPropertyName("permissions")]
-        public List<string>? Permissions { get; set; }
+        WebhookEvent evt;
+        try
+        {
+            evt = Webhooks.Verify(payload, getHeader, _secret, Tolerance);
+        }
+        catch (WebhookVerificationException ex)
+        {
+            return new WebhookProcessResult(401, JsonSerializer.Serialize(new { error = ex.Code }), null, ex);
+        }
+        try
+        {
+            await DispatchAsync(evt).ConfigureAwait(false);
+            return new WebhookProcessResult(200, null, evt, null);
+        }
+        catch (Exception ex)
+        {
+            return new WebhookProcessResult(500, "{\"error\":\"handler_failed\"}", evt, ex);
+        }
     }
 
-    /// <summary>
-    /// Dynamic rules configuration.
-    /// </summary>
-    public class WebhookDynamicRules
+    /// <summary>Dispatch an already verified event.</summary>
+    public Task DispatchAsync(WebhookEvent evt)
     {
-        [JsonPropertyName("static_param")]
-        public string StaticParam { get; set; } = "";
-
-        [JsonPropertyName("format")]
-        public string Format { get; set; } = "";
-
-        [JsonPropertyName("start")]
-        public string Start { get; set; } = "";
-
-        [JsonPropertyName("end")]
-        public string End { get; set; } = "";
-
-        [JsonPropertyName("prefix")]
-        public string Prefix { get; set; } = "";
-
-        [JsonPropertyName("suffix")]
-        public string Suffix { get; set; } = "";
-
-        [JsonPropertyName("checksum_constant")]
-        public int ChecksumConstant { get; set; }
-
-        [JsonPropertyName("checksum_indexes")]
-        public List<int> ChecksumIndexes { get; set; } = new();
-
-        [JsonPropertyName("app_token")]
-        public string AppToken { get; set; } = "";
-
-        [JsonPropertyName("revision")]
-        public string Revision { get; set; } = "";
-    }
-
-    /// <summary>
-    /// Raw webhook event with unparsed data.
-    /// </summary>
-    public class WebhookEvent
-    {
-        [JsonPropertyName("eventType")]
-        public string EventType { get; set; } = "";
-
-        [JsonPropertyName("live")]
-        public bool Live { get; set; }
-
-        [JsonPropertyName("data")]
-        public JsonElement Data { get; set; }
-    }
-
-    /// <summary>
-    /// Data payload for connection.created events.
-    /// </summary>
-    public class ConnectionCreatedEventData
-    {
-        [JsonPropertyName("connection")]
-        public WebhookConnection Connection { get; set; } = new();
-
-        [JsonPropertyName("clientReferenceId")]
-        public string? ClientReferenceId { get; set; }
-    }
-
-    /// <summary>
-    /// Data payload for connection.updated events.
-    /// </summary>
-    public class ConnectionUpdatedEventData
-    {
-        [JsonPropertyName("connection")]
-        public WebhookConnection Connection { get; set; } = new();
-
-        [JsonPropertyName("clientReferenceId")]
-        public string? ClientReferenceId { get; set; }
-    }
-
-    /// <summary>
-    /// Data payload for connection.expired events.
-    /// </summary>
-    public class ConnectionExpiredEventData
-    {
-        [JsonPropertyName("connection")]
-        public WebhookConnection Connection { get; set; } = new();
-
-        [JsonPropertyName("clientReferenceId")]
-        public string? ClientReferenceId { get; set; }
-    }
-
-    /// <summary>
-    /// Data payload for rules.updated events.
-    /// </summary>
-    public class RulesUpdatedEventData
-    {
-        [JsonPropertyName("rules")]
-        public WebhookDynamicRules Rules { get; set; } = new();
-
-        [JsonPropertyName("revision")]
-        public string Revision { get; set; } = "";
-    }
-
-    // ========================================================================
-    // Verification
-    // ========================================================================
-
-    /// <summary>
-    /// Provides methods for Svix webhook signature verification.
-    /// </summary>
-    public static class WebhookVerifier
-    {
-        /// <summary>
-        /// Extract and validate Svix headers from a dictionary.
-        /// </summary>
-        public static WebhookHeaders ExtractHeaders(IDictionary<string, string> headers)
-        {
-            string? Get(string name)
-            {
-                if (headers.TryGetValue(name, out var val)) return val;
-                if (headers.TryGetValue(name.ToLowerInvariant(), out val)) return val;
-                return null;
-            }
-
-            var svixId = Get("svix-id");
-            var svixTimestamp = Get("svix-timestamp");
-            var svixSignature = Get("svix-signature");
-
-            if (string.IsNullOrEmpty(svixId) || string.IsNullOrEmpty(svixTimestamp) || string.IsNullOrEmpty(svixSignature))
-            {
-                throw new WebhookVerificationException(
-                    "Missing required webhook headers (svix-id, svix-timestamp, svix-signature)",
-                    "MISSING_HEADERS");
-            }
-
-            return new WebhookHeaders(svixId!, svixTimestamp!, svixSignature!);
-        }
-
-        /// <summary>
-        /// Verify a webhook signature using the Svix HMAC-SHA256 protocol.
-        /// </summary>
-        /// <param name="payload">Raw JSON payload string.</param>
-        /// <param name="headers">Extracted webhook headers.</param>
-        /// <param name="secret">Webhook signing secret (with or without whsec_ prefix).</param>
-        /// <param name="tolerance">Maximum allowed timestamp age in seconds (default: 300).</param>
-        /// <returns>True if valid.</returns>
-        public static bool VerifySignature(string payload, WebhookHeaders headers, string secret, int tolerance = 300)
-        {
-            // Timestamp check
-            if (!long.TryParse(headers.SvixTimestamp, out var ts))
-            {
-                throw new WebhookVerificationException("Invalid timestamp format", "INVALID_TIMESTAMP");
-            }
-            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            if (Math.Abs(now - ts) > tolerance)
-            {
-                throw new WebhookVerificationException("Webhook timestamp too old", "TIMESTAMP_TOO_OLD");
-            }
-
-            // Compute expected signature
-            var cleanSecret = secret.StartsWith("whsec_") ? secret[6..] : secret;
-            var key = Convert.FromBase64String(cleanSecret);
-            var signed = $"{headers.SvixId}.{headers.SvixTimestamp}.{payload}";
-            using var hmac = new HMACSHA256(key);
-            var expectedBytes = hmac.ComputeHash(Encoding.UTF8.GetBytes(signed));
-            var expected = Convert.ToBase64String(expectedBytes);
-
-            // Parse provided signatures
-            var sigs = headers.SvixSignature
-                .Split(' ')
-                .Select(s => s.Split(',', 2))
-                .Where(parts => parts.Length == 2 && parts[0] == "v1")
-                .Select(parts => parts[1])
-                .ToList();
-
-            if (sigs.Count == 0)
-            {
-                throw new WebhookVerificationException("No valid v1 signatures found", "NO_VALID_SIGNATURES");
-            }
-
-            // Constant-time comparison
-            var expectedBytesForCompare = Encoding.UTF8.GetBytes(expected);
-            foreach (var sig in sigs)
-            {
-                var sigBytes = Encoding.UTF8.GetBytes(sig);
-                if (CryptographicOperations.FixedTimeEquals(expectedBytesForCompare, sigBytes))
-                {
-                    return true;
-                }
-            }
-
-            throw new WebhookVerificationException("Signature verification failed", "SIGNATURE_MISMATCH");
-        }
-
-        /// <summary>
-        /// Verify a webhook and return the parsed event.
-        /// </summary>
-        public static WebhookEvent VerifyPayload(string payload, IDictionary<string, string> headers, string secret, int tolerance = 300)
-        {
-            var wh = ExtractHeaders(headers);
-            VerifySignature(payload, wh, secret, tolerance);
-
-            try
-            {
-                return JsonSerializer.Deserialize<WebhookEvent>(payload)
-                    ?? throw new WebhookVerificationException("Failed to parse webhook payload", "INVALID_JSON");
-            }
-            catch (JsonException)
-            {
-                throw new WebhookVerificationException("Failed to parse webhook payload as JSON", "INVALID_JSON");
-            }
-        }
-
-        /// <summary>
-        /// Parse the Data property of a WebhookEvent into a typed object.
-        /// </summary>
-        public static T ParseEventData<T>(WebhookEvent webhookEvent)
-        {
-            return JsonSerializer.Deserialize<T>(webhookEvent.Data.GetRawText())
-                ?? throw new InvalidOperationException("Failed to deserialize event data");
-        }
-
-        /// <summary>
-        /// Check if an exception is a WebhookVerificationException.
-        /// </summary>
-        public static bool IsVerificationError(Exception ex) => ex is WebhookVerificationException;
-    }
-
-    // ========================================================================
-    // Router
-    // ========================================================================
-
-    /// <summary>
-    /// Routes verified webhook events to registered handler functions.
-    /// </summary>
-    public class WebhookRouter
-    {
-        private readonly Dictionary<string, Func<WebhookEvent, Task>> _handlers = new();
-        private Func<WebhookEvent, Task>? _defaultHandler;
-        private Action<Exception, WebhookEvent?>? _errorHandler;
-        private string _secret;
-        private int _tolerance;
-
-        public WebhookRouter(string secret, int tolerance = 300)
-        {
-            _secret = secret;
-            _tolerance = tolerance;
-        }
-
-        /// <summary>
-        /// Register a handler for a specific event type.
-        /// </summary>
-        public WebhookRouter On(string eventType, Func<WebhookEvent, Task> handler)
-        {
-            _handlers[eventType] = handler;
-            return this;
-        }
-
-        /// <summary>
-        /// Register a synchronous handler for a specific event type.
-        /// </summary>
-        public WebhookRouter On(string eventType, Action<WebhookEvent> handler)
-        {
-            _handlers[eventType] = (evt) => { handler(evt); return Task.CompletedTask; };
-            return this;
-        }
-
-        /// <summary>
-        /// Register a default handler for unmatched event types.
-        /// </summary>
-        public WebhookRouter OnDefault(Func<WebhookEvent, Task> handler)
-        {
-            _defaultHandler = handler;
-            return this;
-        }
-
-        /// <summary>
-        /// Register an error handler.
-        /// </summary>
-        public WebhookRouter OnError(Action<Exception, WebhookEvent?> handler)
-        {
-            _errorHandler = handler;
-            return this;
-        }
-
-        /// <summary>
-        /// Verify and route a webhook from a raw payload and headers.
-        /// </summary>
-        public async Task HandlePayloadAsync(string payload, IDictionary<string, string> headers)
-        {
-            try
-            {
-                var webhookEvent = WebhookVerifier.VerifyPayload(payload, headers, _secret, _tolerance);
-                await ProcessEventAsync(webhookEvent);
-            }
-            catch (Exception ex)
-            {
-                if (_errorHandler != null)
-                    _errorHandler(ex, null);
-                else
-                    throw;
-            }
-        }
-
-        /// <summary>
-        /// Verify and route a webhook from a Stream and headers (e.g., ASP.NET Core).
-        /// </summary>
-        public async Task HandleRequestAsync(Stream body, IDictionary<string, string> headers)
-        {
-            using var reader = new StreamReader(body, Encoding.UTF8);
-            var payload = await reader.ReadToEndAsync();
-            await HandlePayloadAsync(payload, headers);
-        }
-
-        /// <summary>
-        /// Update the webhook secret at runtime.
-        /// </summary>
-        public void UpdateSecret(string secret) => _secret = secret;
-
-        /// <summary>
-        /// Update the timestamp tolerance at runtime.
-        /// </summary>
-        public void UpdateTolerance(int tolerance) => _tolerance = tolerance;
-
-        private async Task ProcessEventAsync(WebhookEvent webhookEvent)
-        {
-            try
-            {
-                if (!_handlers.TryGetValue(webhookEvent.EventType, out var handler))
-                {
-                    handler = _defaultHandler;
-                }
-
-                if (handler == null) return;
-
-                await handler(webhookEvent);
-            }
-            catch (Exception ex)
-            {
-                if (_errorHandler != null)
-                    _errorHandler(ex, webhookEvent);
-                else
-                    throw;
-            }
-        }
+        ArgumentNullException.ThrowIfNull(evt);
+        var handler = _handlers.TryGetValue(evt.Type, out var h) ? h : _defaultHandler;
+        return handler is null ? Task.CompletedTask : handler(evt);
     }
 }

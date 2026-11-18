@@ -8,4 +8,6 @@ obj/
 .env
 .env.*
 !.env.example
-node_modules
+
+# docfx output (dotnet tool exec docfx docfx.json)
+docs/
